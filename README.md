@@ -46,6 +46,30 @@ with the contest's exact pinball loss on the log scale, leave-one-out:
 A single case runs in about 0.06 s locally (the cap is 8 s), and two runs of
 any case produce byte-identical output.
 
+## v2 (round 2 retune)
+
+Same architecture, constants re-chosen by a second leave-one-out pass that
+also tracked the rolling-midnight-unlock family (GTA VI's family) as its own
+segment. Every constant sits in the middle of a plateau that beats v1 on all
+five segments:
+
+| segment | v1 | v2 |
+|---|---|---|
+| all 37 | 0.4575 | **0.4046** |
+| rolling-unlock family (12) | 0.2732 | **0.2631** |
+| hour-1 ≥ 100k | 0.2218 | **0.2135** |
+| hour-1 ≥ 300k | 0.1548 | **0.1370** |
+| family & ≥ 100k | 0.2180 | **0.2031** |
+
+Changes: size-kernel bandwidth 2.5 → 1.5, eve-kernel bandwidth 0.8 → 3.0,
+normal-fit share 0.5 → 0.65, effective-sample blending threshold 10 → 5.
+Extra similarity features (eve-ramp slope, 24 h pre-launch heat, viewers per
+channel), a skewed two-piece fit, hour smoothing and a spread floor were all
+tested against the same cross-validation and rejected — each hurt a primary
+segment or bought nothing. Anchor check: at a synthetic hour-1 print of
+0.8M–2.5M against the full pool, the kernel's effective sample stays ≈12–6
+and the implied curve keeps the classic dip-then-evening-peak shape.
+
 ## Run it locally
 
 ```sh
