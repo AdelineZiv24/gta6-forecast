@@ -1,4 +1,4 @@
-"""gta6-twitch-ccu-forecast-01 entry, v2: a similarity-weighted comparable-launch forecaster.
+"""gta6-twitch-ccu-forecast-01 entry, v4: a similarity-weighted comparable-launch forecaster.
 
 The idea, in one paragraph. A launch day's Twitch curve, hour by hour, is hard to
 predict in absolute terms but much more regular relative to its own first hour:
@@ -88,6 +88,38 @@ worse on family & >= 100k), and an eve-ratio gate toward family-like
 comparables (the eve ratio does not separate the rolling-unlock family:
 family and non-family eve ranges overlap almost completely).
 
+What v4 adds over v3: a third, deliberately gentle similarity axis, chosen
+by a round-4 pass that started from a robustness audit of the final case
+(the audit found no breakage: the pool's own GTA VI pre-release entry can
+never enter the effective pool - it has no print at its day start - the
+42-member final pool only widens the kernel's effective sample, and the
+calibration's extrapolation to a 2.5M hour-1 print applies -0.14 log,
+nowhere near its +/-0.6 cap). The new axis is the ramp inside the release-
+eve window: the log ratio of the window's late half (hours -3..-1) to its
+early half (hours -6..-4). The eve ratio alone does not separate the
+rolling-midnight-unlock family from the rest (their ranges overlap almost
+completely), but the family's eve windows are tightly clustered around a
+flat-to-mild ramp while other launches' windows swing far both ways, so a
+wide Gaussian (bandwidth 2.5 log units - much wider than the feature's own
+family spread) quietly downweights the launches whose eve shape GTA VI's
+cannot resemble. Leave-one-out over the same 37 launches:
+
+    segment            v3       v4
+    all 37             0.3940   0.3946
+    rolling family     0.2614   0.2581
+    hour-1 >= 100k     0.2077   0.2073
+    hour-1 >= 300k     0.1251   0.1245
+    family & >= 100k   0.2050   0.2006
+
+The bandwidth is the middle of the clearing plateau (2.0 and 3.0 also beat
+v3 on both primary segments - family and hour-1 >= 100k - while 1.5 and
+below regress the >= 300k guardrail, the same tight-bandwidth failure seen
+before); the pooled segment pays +0.0006, inside the noise band. Also
+tested in round 4 and rejected with numbers: per-quantile calibration
+fits (they buy >= 300k but cost family, >= 100k and family & >= 100k at
+every damping factor), and per-level damping schedules on the median fit
+(family effect ~0.0000 - a tie, not a win).
+
 Runs as `python3 -P -s /bot/main.py` (Python 3.13, standard library only, no
 network). Deterministic: a pure function of the case file. If anything about a
 case is unusable (no comparables, no hour-1 print), it falls back to the plain
@@ -116,6 +148,11 @@ Z = [_NORM.inv_cdf(t) for t in LEVELS]
 # Similarity kernel bandwidths, in log-print units and in eve-ratio units.
 BW_SIZE = 1.5
 BW_EVE = 3.0
+# Third kernel axis (v4): the ramp inside the eve window, in log units. The
+# bandwidth is deliberately much wider than the family spread of the feature
+# itself, so the term only downweights launches whose eve shape is wildly
+# unlike the target's; it never concentrates the sample on its own.
+BW_SHAPE = 2.5
 # The normal half of each hour's distribution is blended toward the pooled
 # (unweighted) moments when the weighted sample's effective size falls below
 # this, so one dominant comparable cannot dictate the spread alone.
@@ -176,8 +213,24 @@ def eve_ratio(hour_map, day_start, p1):
     return (sum(vals) / len(vals)) / p1
 
 
+def eve_shape(hour_map, day_start):
+    """Log ramp inside the eve window: late half (hours -3..-1) over early
+    half (hours -6..-4), in log units. A rolling unlock's eve window is
+    flat-to-mildly-rising; other launches' windows swing far both ways.
+    Returns None when either half has fewer than 2 sampled hours."""
+    def half(hours):
+        vals = [hour_map.get(day_start - timedelta(hours=k)) for k in hours]
+        vals = [v for v in vals if v]
+        return sum(vals) / len(vals) if len(vals) >= 2 else None
+    early = half((6, 5, 4))
+    late = half((3, 2, 1))
+    if early is None or late is None:
+        return None
+    return math.log(late / early)
+
+
 def launch_features(day_start, hour_map):
-    """(p1, log p1, eve ratio, {hour: log ratio}) for one launch's curve, or None."""
+    """(p1, log p1, eve ratio, {hour: log ratio}, eve shape) for one launch, or None."""
     p1 = hour_map.get(day_start)
     if not p1 or p1 < 1:
         return None
@@ -188,7 +241,8 @@ def launch_features(day_start, hour_map):
             ratios[h] = math.log(v / p1)
     if len(ratios) < 12:
         return None
-    return p1, math.log(p1), eve_ratio(hour_map, day_start, p1), ratios
+    return (p1, math.log(p1), eve_ratio(hour_map, day_start, p1), ratios,
+            eve_shape(hour_map, day_start))
 
 
 def weighted_quantile(pairs, tau):
@@ -239,15 +293,17 @@ def hour_log_quantiles(pool, weights, hour, levels):
     return [med + STRETCH * (v - med) for v in mixed]
 
 
-def kernel_weights(pool, lp_t, eve_t):
+def kernel_weights(pool, lp_t, eve_t, shape_t=0.0):
     """Gaussian similarity weights of the pool members for one target."""
     weights = []
     for f in pool:
         d_size = (f[1] - lp_t) / BW_SIZE
         d_eve = ((f[2] if f[2] is not None else eve_t) - eve_t) / BW_EVE
+        d_shape = ((f[4] if f[4] is not None else shape_t) - shape_t) / BW_SHAPE
+        dist = d_size * d_size + d_eve * d_eve + d_shape * d_shape
         # The floor keeps a far-away pool member at a whisper of weight instead
         # of letting every weight underflow to exactly zero.
-        weights.append(max(math.exp(-(d_size * d_size + d_eve * d_eve)), 1e-12))
+        weights.append(max(math.exp(-dist), 1e-12))
     return weights
 
 
@@ -257,7 +313,7 @@ def _calib_ramp(h):
     return min(1.0, max(0.0, (h - 4) / 4.0))
 
 
-def _member_residuals(pool, eve_t):
+def _member_residuals(pool, eve_t, shape_t=0.0):
     """(pool index, log p1, mean clipped median residual) per pool member.
 
     Each member is forecast from the rest of the pool with the same kernel
@@ -269,7 +325,8 @@ def _member_residuals(pool, eve_t):
     for i, f in enumerate(pool):
         sub = pool[:i] + pool[i + 1:]
         centre_eve = f[2] if f[2] is not None else eve_t
-        w = kernel_weights(sub, f[1], centre_eve)
+        centre_shape = f[4] if f[4] is not None else shape_t
+        w = kernel_weights(sub, f[1], centre_eve, centre_shape)
         num, den = 0.0, 0.0
         for h, r in f[3].items():
             g = _calib_ramp(h)
@@ -286,7 +343,7 @@ def _member_residuals(pool, eve_t):
     return out
 
 
-def calibration_shift(pool, lp_t, eve_t):
+def calibration_shift(pool, lp_t, eve_t, shape_t=0.0):
     """The fitted median residual (log units, before lambda) at the target.
 
     Regresses the members' residuals on their log hour-1 sizes and reads
@@ -295,7 +352,7 @@ def calibration_shift(pool, lp_t, eve_t):
     """
     if len(pool) < 8:
         return 0.0
-    res = _member_residuals(pool, eve_t)
+    res = _member_residuals(pool, eve_t, shape_t)
     if len(res) < 8:
         return 0.0
     lp_bar = sum(f[1] for f in pool) / len(pool)
@@ -324,6 +381,7 @@ def forecast_case(case):
     # The target's own eve ratio, from its whole-hour history before day_start.
     target_map = hourly_map(case.get("history_hourly"))
     target_eve = eve_ratio(target_map, day_start, p1)
+    target_shape = eve_shape(target_map, day_start)
 
     pool = []
     for comp in case.get("comparables") or []:
@@ -338,11 +396,16 @@ def forecast_case(case):
         target_eve = eves[len(eves) // 2] if eves else 1.0
     if target_eve is None:
         target_eve = 1.0
+    if target_shape is None and pool:
+        shapes = sorted(f[4] for f in pool if f[4] is not None)
+        target_shape = shapes[len(shapes) // 2] if shapes else 0.0
+    if target_shape is None:
+        target_shape = 0.0
 
-    weights = kernel_weights(pool, math.log(p1), target_eve)
+    weights = kernel_weights(pool, math.log(p1), target_eve, target_shape)
     shift = 0.0
     if pool:
-        shift = calibration_shift(pool, math.log(p1), target_eve)
+        shift = calibration_shift(pool, math.log(p1), target_eve, target_shape)
         shift = max(-CALIB_MAX_SHIFT, min(CALIB_MAX_SHIFT, CALIB_LAMBDA * shift))
 
     rows = []

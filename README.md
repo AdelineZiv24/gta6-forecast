@@ -19,11 +19,11 @@ absolute terms, so the program works with log-ratios
 `r_h = ln(viewers_h / viewers_1)`:
 
 - Every past launch in the case's `comparables` contributes its ratio curve.
-- Each comparable is weighted by similarity to this case on two axes: the size
-  of its hour-1 print, and its release-eve ratio (the mean of the six hours
-  before day start over hour 1) — the fingerprint of a rolling midnight unlock
-  like GTA VI's, as opposed to a single global unlock, whose day looks entirely
-  different from hour 1.
+- Each comparable is weighted by similarity to this case on three axes: the
+  size of its hour-1 print, its release-eve ratio (the mean of the six hours
+  before day start over hour 1), and the ramp inside that eve window — the
+  fingerprint of a rolling midnight unlock like GTA VI's, as opposed to a
+  single global unlock, whose day looks entirely different from hour 1.
 - Each hour's five quantiles are the average, in log space, of a weighted
   normal fit (blended toward the pooled moments when the weighted sample runs
   thin) and the weighted empirical quantiles, with the spread pulled 10%
@@ -98,6 +98,43 @@ neighbours and with v1 (no ensemble beat v2 on both primaries), hour-block
 stretch / normal-share schedules (within ±0.002 throughout), and
 kernel-weighted local residual fits (same big-launch gains, worse on
 family & ≥ 100k). A full case now runs in about 0.1 s.
+
+## v4 (round 4 eve-shape kernel + final-case audit)
+
+Round 4 first audited the shipped v3 against synthetic final-like cases
+(the final's pool holds 42 comparables, including the four practice
+launches and GTA VI's own pre-release category entry). No breakage: the
+GTA VI entry can never enter the effective pool (it has no print at its
+own day start, so it is filtered out exactly as in practice), the larger
+pool only widens the kernel's effective sample (≈7–14 across a
+0.8M–2.5M hour-1 sweep), the calibration's extrapolation stays tame
+(applied shift −0.10…−0.16 log at those prints, cap ±0.6), every
+degenerate input still yields a valid forecast, and a case runs in
+≈0.1 s of the 8 s cap.
+
+The one change: a third similarity axis, the ramp inside the release-eve
+window — log(late half / early half) of the six hours before day start.
+The eve ratio alone does not separate the rolling-unlock family (the
+ranges overlap almost completely), but family eve windows cluster
+tightly around a flat-to-mild ramp (−0.44…+0.21) while other launches
+swing from −1.66 to +2.42, so a wide Gaussian (bandwidth 2.5) quietly
+downweights launches whose eve shape the target's cannot resemble:
+
+| segment | v3 | v4 |
+|---|---|---|
+| all 37 | **0.3940** | 0.3946 |
+| rolling-unlock family (12) | 0.2614 | **0.2581** |
+| hour-1 ≥ 100k | 0.2077 | **0.2073** |
+| hour-1 ≥ 300k | 0.1251 | **0.1245** |
+| family & ≥ 100k | 0.2050 | **0.2006** |
+
+Bandwidth 2.5 is the middle of the clearing plateau (2.0 and 3.0 also
+beat v3 on both primary segments; 1.5 and below regress the ≥ 300k
+guardrail — the familiar tight-bandwidth failure). The pooled segment
+pays +0.0006, inside the noise band. Also tested and rejected in round
+4: per-quantile calibration fits (better on ≥ 300k, worse on family,
+≥ 100k and family & ≥ 100k at every damping factor) and per-level
+damping schedules on the median fit (family effect ≈ 0.0000, a tie).
 
 ## Run it locally
 
