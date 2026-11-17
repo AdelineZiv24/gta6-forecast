@@ -1,4 +1,4 @@
-"""gta6-twitch-ccu-forecast-01 entry, v4: a similarity-weighted comparable-launch forecaster.
+"""gta6-twitch-ccu-forecast-01 entry, v5: a similarity-weighted comparable-launch forecaster.
 
 The idea, in one paragraph. A launch day's Twitch curve, hour by hour, is hard to
 predict in absolute terms but much more regular relative to its own first hour:
@@ -119,6 +119,46 @@ tested in round 4 and rejected with numbers: per-quantile calibration
 fits (they buy >= 300k but cost family, >= 100k and family & >= 100k at
 every damping factor), and per-level damping schedules on the median fit
 (family effect ~0.0000 - a tie, not a win).
+
+What v5 adds over v4: a second conditioning variable in the
+self-calibration. Round 5 regressed v4's within-pool residuals on the
+pool's other runtime features and found the level bias is not a function
+of size alone: conditional on size, launches with a strong release-eve
+ramp relative to their hour-1 print (a heavy pre-launch build-up - the
+rolling-unlock signature) also run a little below the kernel's median,
+while quiet-eve launches run hot. The calibration fit therefore gains
+log eve ratio as a second regressor beside log hour-1 size - same
+residuals, same clip, same lambda 0.5, same ramp and cap, now one centred
+two-variable OLS (members missing an eve window take the pool median log
+eve, the substitution the kernel already makes). At the target's own
+size the two fits nearly agree - the eve term moderates the downward
+correction by about +0.03 log at a 90th-percentile eve ramp, and the
+fitted shift at a 2.5M print stays near -0.13..-0.16 log, far from the
++/-0.6 cap - so the extrapolation keeps v4's character; the gain is
+spread across the pool (14 of 37 launches improve by more than 0.002,
+across family, big and mid-size alike). Leave-one-out over the same 37
+launches:
+
+    segment            v4       v5
+    all 37             0.3946   0.3949
+    rolling family     0.2581   0.2561
+    hour-1 >= 100k     0.2073   0.2053
+    hour-1 >= 300k     0.1245   0.1230
+    family & >= 100k   0.2006   0.2000
+
+Lambda 0.5 is again the middle of the clearing plateau: 0.45 and 0.55
+also beat v4 on both primary segments and both guardrail segments, and
+0.6-0.7 keep winning the primaries while trading a little family &
+>= 100k back for pooled and >= 300k gains. Also tested in round 5 and
+rejected with numbers: the raw eve ratio as the second regressor (its
+log beats it on all five segments), the eve shape as a third regressor
+alongside the raw eve ratio (collinear; worse on pooled and >= 100k), a
+day-of-week kernel axis (it buys family - console launches cluster on
+Fridays - but taxes the >= 300k segment at every bandwidth, the size
+class the target itself belongs to), a Student-t predictive in place of
+the normal half (helps family and >= 300k, costs >= 100k at every df and
+scaling), and stacking the day-of-week axis on this calibration (the
+family gain grows, but the pooled and >= 300k costs return).
 
 Runs as `python3 -P -s /bot/main.py` (Python 3.13, standard library only, no
 network). Deterministic: a pure function of the case file. If anything about a
@@ -314,7 +354,7 @@ def _calib_ramp(h):
 
 
 def _member_residuals(pool, eve_t, shape_t=0.0):
-    """(pool index, log p1, mean clipped median residual) per pool member.
+    """(log p1, eve ratio, mean clipped median residual) per pool member.
 
     Each member is forecast from the rest of the pool with the same kernel
     and quantile machinery, centred on the member itself; the residual at
@@ -339,32 +379,61 @@ def _member_residuals(pool, eve_t, shape_t=0.0):
             num += g * e
             den += g
         if den > 0:
-            out.append((f[1], num / den))
+            out.append((f[1], f[2], num / den))
     return out
 
 
 def calibration_shift(pool, lp_t, eve_t, shape_t=0.0):
     """The fitted median residual (log units, before lambda) at the target.
 
-    Regresses the members' residuals on their log hour-1 sizes and reads
-    the fit at the target's size. Returns 0 when the pool is too small to
-    say anything.
+    Regresses the members' residuals on their log hour-1 sizes and their
+    log eve ratios (v5) and reads the fit at the target's size and eve
+    ratio. Returns 0 when the pool is too small to say anything.
     """
     if len(pool) < 8:
         return 0.0
     res = _member_residuals(pool, eve_t, shape_t)
     if len(res) < 8:
         return 0.0
-    lp_bar = sum(f[1] for f in pool) / len(pool)
-    xs = [lp - lp_bar for lp, _ in res]
-    ys = [e for _, e in res]
-    mx = sum(xs) / len(xs)
+    # Both regressors are centred at their means over the residual rows;
+    # members missing an eve window take the pool median log eve. A tiny
+    # ridge keeps the normal equations stable under collinearity.
+    raw = {"lp": [r[0] for r in res],
+           "logeve": [math.log(r[1]) if r[1] is not None and r[1] > 0
+                      else None for r in res]}
+    tgt = {"lp": lp_t,
+           "logeve": math.log(eve_t) if eve_t is not None and eve_t > 0
+                     else None}
+    cols, tcols = [], []
+    for nm in ("lp", "logeve"):
+        vals = raw[nm]
+        have = sorted(v for v in vals if v is not None)
+        med = have[len(have) // 2] if have else 0.0
+        filled = [v if v is not None else med for v in vals]
+        mean = sum(filled) / len(filled)
+        cols.append([v - mean for v in filled])
+        tv = tgt[nm]
+        tcols.append((tv if tv is not None else med) - mean)
+    ys = [r[2] for r in res]
     my = sum(ys) / len(ys)
-    sxx = sum((x - mx) ** 2 for x in xs)
-    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-    b = sxy / sxx if sxx > 0 else 0.0
-    a = my - b * mx
-    return a + b * (lp_t - lp_bar)
+    k = len(cols)
+    n = len(ys)
+    A = [[sum(cols[a][i] * cols[b][i] for i in range(n))
+          + (1e-8 if a == b else 0.0) for b in range(k)] for a in range(k)]
+    rhs = [sum(cols[a][i] * (ys[i] - my) for i in range(n)) for a in range(k)]
+    M = [row[:] + [rhs[a]] for a, row in enumerate(A)]
+    for col in range(k):
+        piv = max(range(col, k), key=lambda r: abs(M[r][col]))
+        if abs(M[piv][col]) < 1e-12:
+            return my  # degenerate: fall back to the mean residual
+        M[col], M[piv] = M[piv], M[col]
+        for r in range(k):
+            if r != col:
+                fac = M[r][col] / M[col][col]
+                for cc in range(col, k + 1):
+                    M[r][cc] -= fac * M[col][cc]
+    b = [M[a][k] / M[a][a] for a in range(k)]
+    return my + sum(bj * tj for bj, tj in zip(b, tcols))
 
 
 def persistence_row(p1, hour, levels):
