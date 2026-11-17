@@ -50,6 +50,44 @@ at hours 19-21). The 90% band narrows as the print leaves the pool's range;
 that is the estimator the cross-validation prefers, and the mega-launch
 segment is where it gains most over v1.
 
+What v3 adds over v2: a self-calibration layer, chosen by round 3's loss
+decomposition. The decomposition (leave-one-out, by hour and by quantile)
+showed v2 is well calibrated on average but carries a conditional level
+bias: the biggest launches' days systematically come in below what a
+local-constant kernel predicts for them (their hour-1 spike is
+disproportionate to their day, and a target at the top of the size range
+can only borrow curves from smaller launches), increasingly so as the day
+wears on, while mid-size launches run slightly hot. Round 3 therefore lets
+the case grade its own estimator: every comparable in the pool is
+forecast from the others with the same machinery, the per-launch median
+residuals (clipped at +/-1 log, averaged over hours 5+ on a ramp) are
+regressed on log hour-1 size, and the target's five quantiles are shifted
+in log space by half (lambda = 0.5) of the fitted residual at the target's
+size, ramped in over hours 5-8 and capped at +/-0.6 log. Nothing about the
+target's identity is used - the correction is estimated from the case's
+own comparables at run time. Leave-one-out over the same 37 launches:
+
+    segment            v2       v3
+    all 37             0.4046   0.3940
+    rolling family     0.2631   0.2614
+    hour-1 >= 100k     0.2135   0.2077
+    hour-1 >= 300k     0.1370   0.1251
+    family & >= 100k   0.2031   0.2050
+
+Lambda was picked from the middle of the interval that improves both
+primary segments (family, >= 100k) without moving any guardrail segment
+beyond noise: the response is smooth and monotone from 0.25 to 0.6, and
+the one segment that pays for the correction, family & >= 100k (+0.0019,
+inside the +/-0.003 noise band), pays more only past 0.6. Also tested in
+round 3 and rejected with numbers: quantile-averaging ensembles of v2
+with its plateau neighbours and with v1 (members too correlated; no
+ensemble beat v2 on both primary segments), hour-block stretch and
+normal-share schedules (all within +/-0.002 of v2), kernel-weighted
+local residual fits (same gains as the global fit on the big launches,
+worse on family & >= 100k), and an eve-ratio gate toward family-like
+comparables (the eve ratio does not separate the rolling-unlock family:
+family and non-family eve ranges overlap almost completely).
+
 Runs as `python3 -P -s /bot/main.py` (Python 3.13, standard library only, no
 network). Deterministic: a pure function of the case file. If anything about a
 case is unusable (no comparables, no hour-1 print), it falls back to the plain
@@ -86,6 +124,14 @@ MIN_EFFECTIVE = 5.0
 NORMAL_SHARE = 0.65
 # The mixed quantiles are pulled this far toward the median (1 = untouched).
 STRETCH = 0.9
+
+# Self-calibration (v3): within the case's own pool, each comparable is
+# forecast from the others and its median residuals are regressed on its
+# log hour-1 size; the target's log quantiles shift by CALIB_LAMBDA times
+# the fitted residual at the target's size, ramped in over hours 5-8.
+CALIB_LAMBDA = 0.5
+CALIB_CLIP = 1.0
+CALIB_MAX_SHIFT = 0.6
 
 
 def round2(x):
@@ -193,6 +239,77 @@ def hour_log_quantiles(pool, weights, hour, levels):
     return [med + STRETCH * (v - med) for v in mixed]
 
 
+def kernel_weights(pool, lp_t, eve_t):
+    """Gaussian similarity weights of the pool members for one target."""
+    weights = []
+    for f in pool:
+        d_size = (f[1] - lp_t) / BW_SIZE
+        d_eve = ((f[2] if f[2] is not None else eve_t) - eve_t) / BW_EVE
+        # The floor keeps a far-away pool member at a whisper of weight instead
+        # of letting every weight underflow to exactly zero.
+        weights.append(max(math.exp(-(d_size * d_size + d_eve * d_eve)), 1e-12))
+    return weights
+
+
+def _calib_ramp(h):
+    """How much of the calibration shift applies at hour h (0 to hour 4,
+    ramping over hours 5-8, full from hour 8)."""
+    return min(1.0, max(0.0, (h - 4) / 4.0))
+
+
+def _member_residuals(pool, eve_t):
+    """(pool index, log p1, mean clipped median residual) per pool member.
+
+    Each member is forecast from the rest of the pool with the same kernel
+    and quantile machinery, centred on the member itself; the residual at
+    hour h is the member's actual log ratio minus the forecast median log
+    ratio, clipped and averaged with the calibration ramp as weights.
+    """
+    out = []
+    for i, f in enumerate(pool):
+        sub = pool[:i] + pool[i + 1:]
+        centre_eve = f[2] if f[2] is not None else eve_t
+        w = kernel_weights(sub, f[1], centre_eve)
+        num, den = 0.0, 0.0
+        for h, r in f[3].items():
+            g = _calib_ramp(h)
+            if g <= 0:
+                continue
+            qs = hour_log_quantiles(sub, w, h, LEVELS)
+            if qs is None:
+                continue
+            e = max(-CALIB_CLIP, min(CALIB_CLIP, r - qs[2]))
+            num += g * e
+            den += g
+        if den > 0:
+            out.append((f[1], num / den))
+    return out
+
+
+def calibration_shift(pool, lp_t, eve_t):
+    """The fitted median residual (log units, before lambda) at the target.
+
+    Regresses the members' residuals on their log hour-1 sizes and reads
+    the fit at the target's size. Returns 0 when the pool is too small to
+    say anything.
+    """
+    if len(pool) < 8:
+        return 0.0
+    res = _member_residuals(pool, eve_t)
+    if len(res) < 8:
+        return 0.0
+    lp_bar = sum(f[1] for f in pool) / len(pool)
+    xs = [lp - lp_bar for lp, _ in res]
+    ys = [e for _, e in res]
+    mx = sum(xs) / len(xs)
+    my = sum(ys) / len(ys)
+    sxx = sum((x - mx) ** 2 for x in xs)
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    b = sxy / sxx if sxx > 0 else 0.0
+    a = my - b * mx
+    return a + b * (lp_t - lp_bar)
+
+
 def persistence_row(p1, hour, levels):
     """The fallback: every hour stays at hour 1's print, spread widening slowly."""
     return [p1 * math.exp(_NORM.inv_cdf(t) * 0.15 * math.sqrt(hour - 1)) for t in levels]
@@ -222,13 +339,11 @@ def forecast_case(case):
     if target_eve is None:
         target_eve = 1.0
 
-    weights = []
-    for f in pool:
-        d_size = (f[1] - math.log(p1)) / BW_SIZE
-        d_eve = ((f[2] if f[2] is not None else target_eve) - target_eve) / BW_EVE
-        # The floor keeps a far-away pool member at a whisper of weight instead
-        # of letting every weight underflow to exactly zero.
-        weights.append(max(math.exp(-(d_size * d_size + d_eve * d_eve)), 1e-12))
+    weights = kernel_weights(pool, math.log(p1), target_eve)
+    shift = 0.0
+    if pool:
+        shift = calibration_shift(pool, math.log(p1), target_eve)
+        shift = max(-CALIB_MAX_SHIFT, min(CALIB_MAX_SHIFT, CALIB_LAMBDA * shift))
 
     rows = []
     for spec in case.get("forecast", []):
@@ -237,7 +352,8 @@ def forecast_case(case):
         if log_qs is None:
             qs = persistence_row(p1, h, levels)
         else:
-            qs = [p1 * math.exp(v) for v in log_qs]
+            s = shift * _calib_ramp(h)
+            qs = [p1 * math.exp(v + s) for v in log_qs]
         # Enforce the output contract: finite, in (0, 1e9], non-decreasing.
         clean = []
         for q in qs:

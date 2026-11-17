@@ -70,6 +70,35 @@ segment or bought nothing. Anchor check: at a synthetic hour-1 print of
 0.8M–2.5M against the full pool, the kernel's effective sample stays ≈12–6
 and the implied curve keeps the classic dip-then-evening-peak shape.
 
+## v3 (round 3 self-calibration)
+
+A third pass decomposed v2's loss by hour and quantile: calibrated on
+average, but conditionally biased — the largest launches' days land
+systematically below a local-constant kernel's forecast (a top-of-range
+target can only borrow smaller launches' curves), increasingly late in the
+day. v3 adds a calibration layer that is estimated from the case itself at
+run time: every comparable is forecast from the others, the per-launch
+median residuals (clipped at ±1 log) are regressed on log hour-1 size, and
+the target's quantiles shift by half the fitted residual at its own size,
+ramped in over hours 5–8 and capped at ±0.6 log.
+
+| segment | v2 | v3 |
+|---|---|---|
+| all 37 | 0.4046 | **0.3940** |
+| rolling-unlock family (12) | 0.2631 | **0.2614** |
+| hour-1 ≥ 100k | 0.2135 | **0.2077** |
+| hour-1 ≥ 300k | 0.1370 | **0.1251** |
+| family & ≥ 100k | **0.2031** | 0.2050 |
+
+The damping factor (0.5) is the middle of the range that improves both
+primary segments (family, ≥ 100k); family & ≥ 100k moves +0.0019, inside
+the noise band, and is the only segment that pays. Also tested and
+rejected in round 3: quantile-averaging ensembles of v2 with its plateau
+neighbours and with v1 (no ensemble beat v2 on both primaries), hour-block
+stretch / normal-share schedules (within ±0.002 throughout), and
+kernel-weighted local residual fits (same big-launch gains, worse on
+family & ≥ 100k). A full case now runs in about 0.1 s.
+
 ## Run it locally
 
 ```sh
