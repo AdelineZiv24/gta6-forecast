@@ -1,4 +1,4 @@
-"""gta6-twitch-ccu-forecast-01 entry, v5: a similarity-weighted comparable-launch forecaster.
+"""gta6-twitch-ccu-forecast-01 entry, v6: a similarity-weighted comparable-launch forecaster.
 
 The idea, in one paragraph. A launch day's Twitch curve, hour by hour, is hard to
 predict in absolute terms but much more regular relative to its own first hour:
@@ -160,6 +160,40 @@ the normal half (helps family and >= 300k, costs >= 100k at every df and
 scaling), and stacking the day-of-week axis on this calibration (the
 family gain grows, but the pooled and >= 300k costs return).
 
+What v6 adds over v5: a day-part split of the self-calibration, chosen by
+round 6's loss decomposition. The decomposition showed the single average
+shift is the wrong shape for the bias it corrects: within the pool, the
+residual slope on log size over hours 13-24 is about four times the slope
+over hours 5-12 (-0.13 against -0.03), the mean residual itself grows
+through the day, and the rolling-unlock family still runs about +0.3 log
+hot against the v5 median all afternoon - one ramped average cannot be
+both the small early correction and the large late one. The calibration
+therefore fits its two-regressor OLS twice, on member residuals averaged
+over hours 5-12 and over hours 13-24 separately, and the target's shift
+blends the two fits on a smoothstep across hours 11-14; the ramp in over
+hours 5-8, lambda 0.5 and the +/-0.6 cap are unchanged, and the two fits
+are computed once per case. Leave-one-out over the same 37 launches:
+
+    segment            v5       v6
+    all 37             0.3949   0.3934
+    rolling family     0.2561   0.2560
+    hour-1 >= 100k     0.2053   0.2047
+    hour-1 >= 300k     0.1230   0.1227
+    family & >= 100k   0.2000   0.1997
+
+All five segments improve - the pooled segment most, which the round's
+alternatives could not do. The split is the middle of its plateau: splits
+at 10 and 14 and blends ending at hour 12 or starting at hour 11 also
+clear both primary segments, and lambda stays 0.5 (0.45 fails >= 100k by
+0.0001; 0.55 clears but trades a little family & >= 100k back). Also
+tested in round 6 and rejected with numbers: a third calibration
+regressor (the eve shape, size squared and the size x eve interaction
+carry correlations of +0.01, -0.24 and -0.01 with the post-v5 residuals -
+nothing beyond what size already carries), and retuned kernel bandwidths
+under the v5 calibration (the eve-shape axis at 2.0 clears both primary
+segments but pays +0.0012 pooled, and at 1.5 it wrecks >= 300k, the same
+tight-bandwidth failure as round 4).
+
 Runs as `python3 -P -s /bot/main.py` (Python 3.13, standard library only, no
 network). Deterministic: a pure function of the case file. If anything about a
 case is unusable (no comparables, no hour-1 print), it falls back to the plain
@@ -209,6 +243,14 @@ STRETCH = 0.9
 CALIB_LAMBDA = 0.5
 CALIB_CLIP = 1.0
 CALIB_MAX_SHIFT = 0.6
+# Day-part calibration (v6): the self-calibration fits the two-regressor
+# OLS separately on member residuals averaged over hours 5-12 and over
+# hours 13-24, and the target's shift blends the two fits across hours
+# 11-14. CALIB_BLOCKS exists only so the v5 design stays reproducible by
+# flipping one flag; the shipped entry runs with it on.
+CALIB_BLOCKS = True
+BLOCK_SPLIT = 12          # early block: hours 5..12, late: 13..24
+BLOCK_BLEND = (11, 14)    # smoothstep window between the two fits
 
 
 def round2(x):
@@ -383,21 +425,31 @@ def _member_residuals(pool, eve_t, shape_t=0.0):
     return out
 
 
-def calibration_shift(pool, lp_t, eve_t, shape_t=0.0):
-    """The fitted median residual (log units, before lambda) at the target.
+def _member_residuals_h(pool, eve_t, shape_t=0.0):
+    """Like _member_residuals but keeps the per-hour residuals:
+    (log p1, eve ratio, {hour: clipped median residual}) per pool member."""
+    out = []
+    for i, f in enumerate(pool):
+        sub = pool[:i] + pool[i + 1:]
+        centre_eve = f[2] if f[2] is not None else eve_t
+        centre_shape = f[4] if f[4] is not None else shape_t
+        w = kernel_weights(sub, f[1], centre_eve, centre_shape)
+        per = {}
+        for h, r in f[3].items():
+            if _calib_ramp(h) <= 0:
+                continue
+            qs = hour_log_quantiles(sub, w, h, LEVELS)
+            if qs is None:
+                continue
+            per[h] = max(-CALIB_CLIP, min(CALIB_CLIP, r - qs[2]))
+        if per:
+            out.append((f[1], f[2], per))
+    return out
 
-    Regresses the members' residuals on their log hour-1 sizes and their
-    log eve ratios (v5) and reads the fit at the target's size and eve
-    ratio. Returns 0 when the pool is too small to say anything.
-    """
-    if len(pool) < 8:
-        return 0.0
-    res = _member_residuals(pool, eve_t, shape_t)
-    if len(res) < 8:
-        return 0.0
-    # Both regressors are centred at their means over the residual rows;
-    # members missing an eve window take the pool median log eve. A tiny
-    # ridge keeps the normal equations stable under collinearity.
+
+def _fit_shift(res, lp_t, eve_t):
+    """The v5 two-regressor centred OLS read at the target, where res is a
+    list of (log p1, eve ratio, scalar residual)."""
     raw = {"lp": [r[0] for r in res],
            "logeve": [math.log(r[1]) if r[1] is not None and r[1] > 0
                       else None for r in res]}
@@ -434,6 +486,87 @@ def calibration_shift(pool, lp_t, eve_t, shape_t=0.0):
                     M[r][cc] -= fac * M[col][cc]
     b = [M[a][k] / M[a][a] for a in range(k)]
     return my + sum(bj * tj for bj, tj in zip(b, tcols))
+
+
+def calibration_shift(pool, lp_t, eve_t, shape_t=0.0):
+    """The fitted median residual (log units, before lambda) at the target.
+
+    Regresses the members' residuals on their log hour-1 sizes and their
+    log eve ratios (v5) and reads the fit at the target's size and eve
+    ratio. Returns 0 when the pool is too small to say anything.
+    """
+    if len(pool) < 8:
+        return 0.0
+    res = _member_residuals(pool, eve_t, shape_t)
+    if len(res) < 8:
+        return 0.0
+    return _fit_shift(res, lp_t, eve_t)
+
+
+_BLOCK_FIT_CACHE = []
+
+
+def _block_fits(pool, lp_t, eve_t, shape_t):
+    """(early, late) fitted residuals for this pool/target, computed once.
+
+    forecast_case asks for the shift at 23 hours against the same pool;
+    the two fits are computed on the first ask and reused. The cache holds
+    the pool list itself, so identity can never be confused after garbage
+    collection.
+    """
+    if (_BLOCK_FIT_CACHE and _BLOCK_FIT_CACHE[0] is pool
+            and _BLOCK_FIT_CACHE[1] == lp_t and _BLOCK_FIT_CACHE[2] == eve_t
+            and _BLOCK_FIT_CACHE[3] == shape_t):
+        return _BLOCK_FIT_CACHE[4]
+    if len(pool) < 8:
+        out = (None, None)
+        _BLOCK_FIT_CACHE[:] = [pool, lp_t, eve_t, shape_t, out]
+        return out
+    resh = _member_residuals_h(pool, eve_t, shape_t)
+    if len(resh) < 8:
+        out = (None, None)
+        _BLOCK_FIT_CACHE[:] = [pool, lp_t, eve_t, shape_t, out]
+        return out
+
+    def block_fit(lo, hi):
+        rows = []
+        for lp, ev, per in resh:
+            vals = [(hh, e) for hh, e in per.items() if lo <= hh <= hi]
+            if not vals:
+                continue
+            num = sum(_calib_ramp(hh) * e for hh, e in vals)
+            den = sum(_calib_ramp(hh) for hh, e in vals)
+            if den > 0:
+                rows.append((lp, ev, num / den))
+        if len(rows) < 8:
+            return None
+        return _fit_shift(rows, lp_t, eve_t)
+
+    out = (block_fit(5, BLOCK_SPLIT), block_fit(BLOCK_SPLIT + 1, 24))
+    _BLOCK_FIT_CACHE[:] = [pool, lp_t, eve_t, shape_t, out]
+    return out
+
+
+def calibration_shift_h(pool, lp_t, eve_t, shape_t, h):
+    """Day-part variant: the fitted residual at hour h, blending an early
+    fit (member residuals averaged over hours 5..BLOCK_SPLIT) and a late
+    fit (BLOCK_SPLIT+1..24) across BLOCK_BLEND. Before lambda."""
+    early, late = _block_fits(pool, lp_t, eve_t, shape_t)
+    if early is None and late is None:
+        return 0.0
+    if early is None:
+        return late
+    if late is None:
+        return early
+    a, b = BLOCK_BLEND
+    if h <= a:
+        w = 0.0
+    elif h >= b:
+        w = 1.0
+    else:
+        x = (h - a) / (b - a)
+        w = x * x * (3 - 2 * x)
+    return (1 - w) * early + w * late
 
 
 def persistence_row(p1, hour, levels):
@@ -473,7 +606,7 @@ def forecast_case(case):
 
     weights = kernel_weights(pool, math.log(p1), target_eve, target_shape)
     shift = 0.0
-    if pool:
+    if pool and not CALIB_BLOCKS:
         shift = calibration_shift(pool, math.log(p1), target_eve, target_shape)
         shift = max(-CALIB_MAX_SHIFT, min(CALIB_MAX_SHIFT, CALIB_LAMBDA * shift))
 
@@ -484,7 +617,13 @@ def forecast_case(case):
         if log_qs is None:
             qs = persistence_row(p1, h, levels)
         else:
-            s = shift * _calib_ramp(h)
+            if CALIB_BLOCKS and pool:
+                sh = calibration_shift_h(pool, math.log(p1), target_eve,
+                                         target_shape, h)
+                s = max(-CALIB_MAX_SHIFT,
+                        min(CALIB_MAX_SHIFT, CALIB_LAMBDA * sh)) * _calib_ramp(h)
+            else:
+                s = shift * _calib_ramp(h)
             qs = [p1 * math.exp(v + s) for v in log_qs]
         # Enforce the output contract: finite, in (0, 1e9], non-decreasing.
         clean = []

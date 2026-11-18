@@ -136,6 +136,37 @@ pays +0.0006, inside the noise band. Also tested and rejected in round
 ≥ 100k and family & ≥ 100k at every damping factor) and per-level
 damping schedules on the median fit (family effect ≈ 0.0000, a tie).
 
+## v6 (round 6 day-part calibration)
+
+Round 6 decomposed v5's loss by hour block and segment (v5 had added the
+log eve ratio as a second calibration regressor beside log size). The
+calibration's single average shift is the wrong shape for the bias it
+corrects: the residual slope on log size over hours 13–24 is about four
+times the slope over hours 5–12, and the rolling-unlock family still runs
+≈ +0.3 log hot against the v5 median all afternoon. v6 fits the
+two-regressor calibration twice — on member residuals averaged over
+hours 5–12 and over hours 13–24 — and blends the two fitted shifts on a
+smoothstep across hours 11–14 (the ramp in over hours 5–8, λ = 0.5 and
+the ±0.6 cap are unchanged; both fits are computed once per case):
+
+| segment | v5 | v6 |
+|---|---|---|
+| all 37 | 0.3949 | **0.3934** |
+| rolling-unlock family (12) | 0.2561 | **0.2560** |
+| hour-1 ≥ 100k | 0.2053 | **0.2047** |
+| hour-1 ≥ 300k | 0.1230 | **0.1227** |
+| family & ≥ 100k | 0.2000 | **0.1997** |
+
+All five segments improve — the pooled segment most. Split 12 is the
+middle of the clearing plateau (splits 10 and 14 and neighbouring blend
+windows also clear both primary segments). Also tested and rejected in
+round 6: a third calibration regressor (eve shape, size squared and the
+size × eve interaction carry correlations of +0.01, −0.24 and −0.01 with
+the post-v5 residuals — nothing beyond what size already carries) and
+retuned kernel bandwidths under the v5 calibration (the eve-shape axis
+at 2.0 clears both primaries but pays +0.0012 pooled; at 1.5 it wrecks
+≥ 300k, the tight-bandwidth failure again).
+
 ## Run it locally
 
 ```sh
